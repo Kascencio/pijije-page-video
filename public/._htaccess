@@ -1,0 +1,56 @@
+# --- Seguridad básica ---
+Options -Indexes
+
+# Bloquear archivos sensibles por extensión
+<FilesMatch "\.(htaccess|htpasswd|ini|log|sh|inc|bak|sql)$">
+  Require all denied
+</FilesMatch>
+
+# Bloquear dotfiles y backups temporales
+<FilesMatch "^(\.|#).*">
+  Require all denied
+</FilesMatch>
+<FilesMatch "~$">
+  Require all denied
+</FilesMatch>
+
+# Bloquear acceso a carpetas internas (si existieran bajo public)
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^(?:lib|secure|config)/ - [F,L]
+
+  # Bloquear archivos de configuración comunes
+  RewriteCond %{REQUEST_URI} (?:^|/)(config\.php|\.env|composer\.(json|lock)|package\.json)$ [NC]
+  RewriteRule ^ - [F,L]
+</IfModule>
+
+# Headers esenciales (los demás ya los añade PHP)
+<IfModule mod_headers.c>
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set X-Frame-Options "DENY"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header unset X-Powered-By
+</IfModule>
+
+# Compresión
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/plain text/html text/xml text/css application/xml application/xhtml+xml application/rss+xml application/javascript application/x-javascript
+</IfModule>
+
+# Caché estáticos
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresByType image/jpg "access plus 1 month"
+  ExpiresByType image/jpeg "access plus 1 month"
+  ExpiresByType image/gif "access plus 1 month"
+  ExpiresByType image/png "access plus 1 month"
+  ExpiresByType image/webp "access plus 1 month"
+  ExpiresByType image/svg+xml "access plus 1 month"
+  ExpiresByType text/css "access plus 1 month"
+  ExpiresByType application/javascript "access plus 1 month"
+  ExpiresByType application/x-javascript "access plus 1 month"
+  ExpiresByType font/woff "access plus 1 year"
+  ExpiresByType font/woff2 "access plus 1 year"
+  ExpiresByType application/font-woff "access plus 1 year"
+  ExpiresByType application/font-woff2 "access plus 1 year"
+</IfModule>
