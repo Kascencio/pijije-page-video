@@ -6,7 +6,7 @@ $isLoggedIn = isLoggedIn();
 
 // Si no está logueado, redirigir al login
 if (!$isLoggedIn) {
-    redirect('/login.php');
+    redirect('login.php');
 }
 
 // Verificar si tiene acceso al curso
@@ -126,7 +126,7 @@ $hasAccess = hasAccess(getCurrentUserId(), $config['app']['course_id']);
         <h1>¡Pago Exitoso!</h1>
         
         <p>
-            Tu pago ha sido procesado correctamente. Ya tienes acceso completo al curso de Ganadería Regenerativa.
+            Tu pago ha sido procesado correctamente. Ya tienes acceso completo a <?= escape(courseTitle()) ?>.
         </p>
         
         <?php if ($hasAccess): ?>

@@ -8,8 +8,8 @@
  * Verificar rate limit
  */
 function checkRateLimit($endpoint, $identifier = null, $maxHits = null, $windowSeconds = null) {
-    $config = require_once __DIR__ . '/../../secure/config.php';
-    $rateConfig = $config['security']['rate_limit'];
+    $cfg = require __DIR__ . '/../../secure/config.php';
+    $rateConfig = $cfg['security']['rate_limit'] ?? ['max_hits'=>20,'window_sec'=>900];
     
     // Usar configuración por defecto si no se especifica
     $maxHits = $maxHits ?? $rateConfig['max_hits'];
@@ -38,27 +38,40 @@ function checkRateLimit($endpoint, $identifier = null, $maxHits = null, $windowS
         );
         
         if (!$record) {
-            // Primera petición
-            $db->insert('rate_limits', [
-                'identifier' => $identifier,
-                'endpoint' => $endpoint,
-                'hits' => 1,
-                'window_start' => now()
-            ]);
-            
+            // Primera petición - usar NOW() de MySQL para evitar desajustes de zona horaria
+            $db->query(
+                'INSERT INTO rate_limits (identifier, endpoint, hits, window_start) VALUES (?,?,1,NOW())',
+                [$identifier, $endpoint]
+            );
             return true;
         }
-        
+
+        // Obtener elapsed para decidir si expirar (TIMESTAMPDIFF ya existe en canAttempt, aquí lo recalculamos)
+        $elapsedRow = $db->fetchOne(
+            'SELECT TIMESTAMPDIFF(SECOND, window_start, NOW()) AS elapsed FROM rate_limits WHERE identifier = ? AND endpoint = ?',
+            [$identifier, $endpoint]
+        );
+        $elapsed = (int)($elapsedRow['elapsed'] ?? 0);
+        if ($elapsed < 0) {
+            // Timestamp en el futuro -> normalizar reiniciando ventana
+            $db->query('UPDATE rate_limits SET hits = 1, window_start = NOW() WHERE identifier = ? AND endpoint = ?', [$identifier, $endpoint]);
+            return true;
+        }
+        if ($elapsed >= $windowSeconds) {
+            // Ventana expirada: reiniciar contador
+            $db->query('UPDATE rate_limits SET hits = 1, window_start = NOW() WHERE identifier = ? AND endpoint = ?', [$identifier, $endpoint]);
+            return true;
+        }
+
         if ($record['hits'] >= $maxHits) {
-            // Rate limit excedido
             logSecurity('rate_limit_exceeded', [
                 'identifier' => $identifier,
                 'endpoint' => $endpoint,
                 'hits' => $record['hits'],
                 'max_hits' => $maxHits,
-                'window_seconds' => $windowSeconds
+                'window_seconds' => $windowSeconds,
+                'remaining_seconds' => max(0, $windowSeconds - $elapsed)
             ]);
-            
             return false;
         }
         
@@ -85,7 +98,7 @@ function rateLimitMiddleware($endpoint, $maxHits = null, $windowSeconds = null) 
         http_response_code(429);
         header('Retry-After: ' . ($windowSeconds ?? 900));
         
-        if (isAjax()) {
+        if (function_exists('isAjax') && isAjax()) {
             jsonResponse([
                 'error' => 'Demasiadas peticiones. Intenta nuevamente más tarde.',
                 'retry_after' => $windowSeconds ?? 900
@@ -110,6 +123,161 @@ function getRateLimitConfig($endpoint) {
     ];
     
     return $configs[$endpoint] ?? $configs['default'];
+}
+
+/**
+ * Obtener estado de intentos sin incrementar (para credenciales)
+ * Devuelve: ['allowed'=>bool,'remaining'=>int,'hits'=>int,'max'=>int,'retry_after'=>int]
+ */
+function canAttempt($endpoint, $identifier = null) {
+    $cfg = getRateLimitConfig($endpoint);
+    $maxHits = $cfg['max_hits'];
+    $window = $cfg['window_sec'];
+    if ($identifier === null) {
+        $identifier = getRealIp();
+    } else {
+        $identifier = 'user_' . $identifier;
+    }
+    $db = getDB();
+    try {
+        // Limpiar expirados para este endpoint/identificador
+        $db->query(
+            'DELETE FROM rate_limits WHERE identifier = ? AND endpoint = ? AND window_start < DATE_SUB(NOW(), INTERVAL ? SECOND)',
+            [$identifier, $endpoint, $window]
+        );
+        $record = $db->fetchOne(
+            'SELECT hits, TIMESTAMPDIFF(SECOND, window_start, NOW()) as elapsed FROM rate_limits WHERE identifier = ? AND endpoint = ?',
+            [$identifier, $endpoint]
+        );
+        if (!$record) {
+            return [
+                'allowed' => true,
+                'remaining' => $maxHits,
+                'hits' => 0,
+                'max' => $maxHits,
+                'retry_after' => 0
+            ];
+        }
+        $hits = (int)$record['hits'];
+        $elapsed = (int)$record['elapsed'];
+        if ($elapsed < 0) {
+            // Normalizar timestamps futuros
+            $db->query('UPDATE rate_limits SET hits = 0, window_start = NOW() WHERE identifier = ? AND endpoint = ?', [$identifier, $endpoint]);
+            return [
+                'allowed' => true,
+                'remaining' => $maxHits,
+                'hits' => 0,
+                'max' => $maxHits,
+                'retry_after' => 0
+            ];
+        }
+        if ($elapsed >= $window) {
+            // Ventana expirada: reiniciar
+            $db->query('UPDATE rate_limits SET hits = 0, window_start = NOW() WHERE identifier = ? AND endpoint = ?', [$identifier, $endpoint]);
+            return [
+                'allowed' => true,
+                'remaining' => $maxHits,
+                'hits' => 0,
+                'max' => $maxHits,
+                'retry_after' => 0
+            ];
+        }
+        if ($hits >= $maxHits) {
+            $retry = max(0, $window - $elapsed);
+            return [
+                'allowed' => false,
+                'remaining' => 0,
+                'hits' => $hits,
+                'max' => $maxHits,
+                'retry_after' => $retry
+            ];
+        }
+        return [
+            'allowed' => true,
+            'remaining' => $maxHits - $hits,
+            'hits' => $hits,
+            'max' => $maxHits,
+            'retry_after' => 0
+        ];
+    } catch (Exception $e) {
+        error_log('canAttempt error: ' . $e->getMessage());
+        return [
+            'allowed' => true,
+            'remaining' => $maxHits,
+            'hits' => 0,
+            'max' => $maxHits,
+            'retry_after' => 0
+        ];
+    }
+}
+
+/**
+ * Registrar intento fallido (solo se llama si falla login/registro)
+ */
+function recordFailedAttempt($endpoint, $identifier = null) {
+    $cfg = getRateLimitConfig($endpoint);
+    $maxHits = $cfg['max_hits'];
+    $window = $cfg['window_sec'];
+    if ($identifier === null) {
+        $identifier = getRealIp();
+    } else {
+        $identifier = 'user_' . $identifier;
+    }
+    $db = getDB();
+    try {
+        $record = $db->fetchOne(
+            'SELECT hits FROM rate_limits WHERE identifier = ? AND endpoint = ?',
+            [$identifier, $endpoint]
+        );
+        if (!$record) {
+            $db->query('INSERT INTO rate_limits (identifier, endpoint, hits, window_start) VALUES (?,?,1,NOW())', [$identifier, $endpoint]);
+            return 1;
+        }
+        // Verificar expiración/futuro
+        $elapsedRow = $db->fetchOne('SELECT TIMESTAMPDIFF(SECOND, window_start, NOW()) AS elapsed FROM rate_limits WHERE identifier = ? AND endpoint = ?', [$identifier, $endpoint]);
+        $elapsed = (int)($elapsedRow['elapsed'] ?? 0);
+        if ($elapsed < 0 || $elapsed >= $window) {
+            $db->query('UPDATE rate_limits SET hits = 1, window_start = NOW() WHERE identifier = ? AND endpoint = ?', [$identifier, $endpoint]);
+            $hits = 1;
+        } else {
+            $hits = (int)$record['hits'];
+            if ($hits >= $maxHits) {
+                return $hits; // ya excedido
+            }
+            $db->query('UPDATE rate_limits SET hits = hits + 1 WHERE identifier = ? AND endpoint = ?', [$identifier, $endpoint]);
+            $hits++;
+        }
+        if ($hits >= $maxHits) {
+            logSecurity('rate_limit_exceeded', [
+                'identifier' => $identifier,
+                'endpoint' => $endpoint,
+                'hits' => $hits,
+                'max_hits' => $maxHits,
+                'window_seconds' => $window
+            ]);
+        }
+        return $hits;
+    } catch (Exception $e) {
+        error_log('recordFailedAttempt error: ' . $e->getMessage());
+        return 0;
+    }
+}
+
+/**
+ * Resetear contador (en éxito de login opcional)
+ */
+function resetRateLimit($endpoint, $identifier = null) {
+    if ($identifier === null) {
+        $identifier = getRealIp();
+    } else {
+        $identifier = 'user_' . $identifier;
+    }
+    try {
+        $db = getDB();
+        $db->query('DELETE FROM rate_limits WHERE identifier = ? AND endpoint = ?', [$identifier, $endpoint]);
+    } catch (Exception $e) {
+        error_log('resetRateLimit error: ' . $e->getMessage());
+    }
 }
 
 /**

@@ -6,51 +6,69 @@
 
 require_once __DIR__ . '/rate_limit.php';
 
+// Migración ligera en runtime: ampliar users.pass_hash si quedó de una versión anterior (CHAR(60))
+try {
+    $dbm = getDB();
+    $col = $dbm->fetchOne("SHOW COLUMNS FROM users LIKE 'pass_hash'");
+    if ($col && stripos($col['Type'], 'char(60)') !== false) {
+        error_log('[MIGRATION] Alterando users.pass_hash a VARCHAR(255)');
+        $dbm->query('ALTER TABLE users MODIFY pass_hash VARCHAR(255) NOT NULL');
+    }
+    // Añadir columna last_login si no existe
+    $colLL = $dbm->fetchOne("SHOW COLUMNS FROM users LIKE 'last_login'");
+    if (!$colLL) {
+        error_log('[MIGRATION] Añadiendo columna users.last_login DATETIME NULL');
+        try { $dbm->query('ALTER TABLE users ADD last_login DATETIME NULL AFTER created_at'); } catch (Throwable $e) { /* silencioso */ }
+    }
+} catch (Exception $e) {
+    // Silencioso, no crítico para flujo normal
+}
+
 /**
  * Registrar nuevo usuario
  */
 function registerUser($name, $email, $password) {
     $db = getDB();
-    
+
     // Validaciones
-    $email = validateEmail($email);
-    if (!$email) {
+    $validEmail = validateEmail($email);
+    if (!$validEmail) {
         return ['success' => false, 'error' => 'Email inválido'];
     }
-    
-    $name = validateName($name);
-    if (!$name) {
+
+    $validName = validateName($name);
+    if (!$validName) {
         return ['success' => false, 'error' => 'Nombre inválido. Solo se permiten letras, espacios, apostrofes, puntos y guiones'];
     }
-    
+
     $passwordValidation = validatePasswordPolicy($password);
     if ($passwordValidation !== true) {
         return ['success' => false, 'error' => $passwordValidation];
     }
-    
+
     try {
         // Verificar si el email ya existe
-        $existing = $db->fetchOne('SELECT id FROM users WHERE email = ?', [$email]);
+        $existing = $db->fetchOne('SELECT id FROM users WHERE email = ?', [$validEmail]);
         if ($existing) {
             return ['success' => false, 'error' => 'El email ya está registrado'];
         }
-        
+
         // Crear usuario
         $userId = $db->insert('users', [
-            'name' => $name,
-            'email' => $email,
+            'name' => $validName,
+            'email' => $validEmail,
             'pass_hash' => hashPassword($password),
             'verified' => 1,
             'created_at' => now()
         ]);
-        
+
         logSecurity('user_registered', [
             'user_id' => $userId,
-            'email' => $email
+            'email' => $validEmail
         ]);
-        
+
         return ['success' => true, 'user_id' => $userId];
-        
+
     } catch (Exception $e) {
         error_log("User registration failed: " . $e->getMessage());
         return ['success' => false, 'error' => 'Error interno del servidor'];
@@ -61,13 +79,14 @@ function registerUser($name, $email, $password) {
  * Autenticar usuario
  */
 function authenticateUser($email, $password) {
-    $config = require_once __DIR__ . '/../../secure/config.php';
+    $config = require __DIR__ . '/../../secure/config.php';
     $db = getDB();
-    
-    $email = validateEmail($email);
-    if (!$email) {
+
+    $validEmail = validateEmail($email);
+    if ($validEmail === false) {
         return ['success' => false, 'error' => 'Credenciales inválidas'];
     }
+    $email = $validEmail; // string normalizado
     
     try {
         // Obtener usuario
@@ -133,9 +152,9 @@ function authenticateUser($email, $password) {
             return ['success' => false, 'error' => 'Credenciales inválidas'];
         }
         
-        // Login exitoso - limpiar intentos y bloqueo
+        // Login exitoso - limpiar intentos, bloqueo y registrar last_login
         $db->update('users', 
-            ['login_attempts' => 0, 'locked_until' => null],
+            ['login_attempts' => 0, 'locked_until' => null, 'last_login' => now()],
             'id = ?',
             [$user['id']]
         );

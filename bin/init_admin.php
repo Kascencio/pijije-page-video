@@ -4,7 +4,8 @@
  * Ejecutar: php bin/init_admin.php
  */
 
-require_once __DIR__ . '/../public/lib/db.php';
+// Cargar bootstrap completo para tener hashPassword(), getDB(), etc.
+require_once __DIR__ . '/../public/lib/bootstrap.php';
 
 function initAdminPanel() {
     echo "🚀 Inicializando Panel de Administración...\n\n";
@@ -34,6 +35,18 @@ function initAdminPanel() {
         
         // 2. Crear admin por defecto
         echo "\n👤 Creando administrador por defecto...\n";
+
+        // Migración automática: ampliar pass_hash si quedó como CHAR(60)
+        try {
+            $col = $db->fetchOne("SHOW COLUMNS FROM admins LIKE 'pass_hash'");
+            if ($col && stripos($col['Type'], 'char(60)') !== false) {
+                echo "🔄 Migrando columna pass_hash a VARCHAR(255)...\n";
+                $db->query('ALTER TABLE admins MODIFY pass_hash VARCHAR(255) NOT NULL');
+                echo "✅ Columna pass_hash migrada\n";
+            }
+        } catch (Exception $e) {
+            echo "⚠️  No se pudo verificar/migrar pass_hash: " . $e->getMessage() . "\n";
+        }
         
         // Verificar si ya existe
         $existingAdmin = $db->fetchOne('SELECT id FROM admins WHERE username = "admin"');
@@ -43,7 +56,11 @@ function initAdminPanel() {
         } else {
             // Crear admin con contraseña 'admin123'
             $password = 'admin123';
-            $hash = password_hash($password, PASSWORD_ARGON2ID);
+            // Usar helper que hace fallback si Argon2ID no está disponible
+            if (!function_exists('hashPassword')) {
+                require_once __DIR__ . '/../public/lib/utils.php';
+            }
+            $hash = hashPassword($password);
             
             $db->insert('admins', [
                 'username' => 'admin',

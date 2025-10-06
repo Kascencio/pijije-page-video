@@ -8,11 +8,32 @@
  * Obtener access token de PayPal
  */
 function getPayPalAccessToken() {
-    $config = require_once __DIR__ . '/../../secure/config.php';
+    $config = config();
     $paypalConfig = $config['paypal'];
-    
-    // Verificar si tenemos un token en cache
-    $cacheFile = __DIR__ . '/../../secure/cache/paypal_token.json';
+    if (empty($paypalConfig['client_id']) || empty($paypalConfig['secret'])) {
+        throw new Exception('Credenciales PayPal incompletas (client_id o secret vacío)');
+    }
+
+    // 1) Revisión rápida de caché en sesión (para entornos sin escritura)
+    if (session_status() === PHP_SESSION_ACTIVE && !empty($_SESSION['paypal_token'])) {
+        $sessTok = $_SESSION['paypal_token'];
+        if (isset($sessTok['access_token'], $sessTok['expires']) && $sessTok['expires'] > time()) {
+            return $sessTok['access_token'];
+        }
+    }
+    // Determinar ruta de cache (con fallback si permisos fallan)
+    $primaryCacheDir = realpath(__DIR__ . '/../../secure/cache') ?: (__DIR__ . '/../../secure/cache');
+    if (!is_dir($primaryCacheDir)) {
+        @mkdir($primaryCacheDir, 0755, true);
+    }
+    $cacheWritable = is_dir($primaryCacheDir) && is_writable($primaryCacheDir);
+    $cacheDir = $cacheWritable ? $primaryCacheDir : sys_get_temp_dir();
+    $cacheFile = rtrim($cacheDir, DIRECTORY_SEPARATOR) . '/paypal_token.json';
+    if (!$cacheWritable) {
+        // Log solo una vez por ejecución
+        static $warned = false; if (!$warned) { $warned = true; error_log('[PAYPAL OAUTH] Usando fallback de cache en temp dir: '.$cacheDir); }
+    }
+    // Verificar si tenemos un token en cache (ignorar si file no es legible)
     if (file_exists($cacheFile)) {
         $cached = json_decode(file_get_contents($cacheFile), true);
         if ($cached && $cached['expires'] > time()) {
@@ -20,26 +41,51 @@ function getPayPalAccessToken() {
         }
     }
     
-    // Obtener nuevo token
+    // Obtener nuevo token (seguir redirecciones por si base_api redirige)
     $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $paypalConfig['base_api'] . '/v1/oauth2/token');
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Accept: application/json',
-        'Accept-Language: en_US',
-        'Content-Type: application/x-www-form-urlencoded'
+    $oauthUrl = rtrim($paypalConfig['base_api'], '/') . '/v1/oauth2/token';
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $oauthUrl,
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Accept: application/json',
+            'Accept-Language: en_US',
+            'Content-Type: application/x-www-form-urlencoded'
+        ],
+        CURLOPT_POSTFIELDS => 'grant_type=client_credentials',
+        CURLOPT_USERPWD => $paypalConfig['client_id'] . ':' . $paypalConfig['secret'],
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 30,
     ]);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, 'grant_type=client_credentials');
-    curl_setopt($ch, CURLOPT_USERPWD, $paypalConfig['client_id'] . ':' . $paypalConfig['secret']);
-    
     $response = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+    $redirCount = curl_getinfo($ch, CURLINFO_REDIRECT_COUNT);
+    $curlErr = curl_error($ch);
     curl_close($ch);
+    if ($curlErr) {
+        throw new Exception('cURL error solicitando token: ' . $curlErr);
+    }
     
+    if ($response === false) {
+        throw new Exception('cURL devolvió false al solicitar token');
+    }
     if ($httpCode !== 200) {
-        error_log("PayPal OAuth failed: " . $response);
-        throw new Exception('Error al obtener token de PayPal');
+        $snippet = substr($response ?? '', 0, 300);
+        $detail = 'HTTP ' . $httpCode;
+        if ($redirCount > 0) { $detail .= ' redirs=' . $redirCount; }
+        if ($finalUrl && $finalUrl !== $oauthUrl) { $detail .= ' final=' . $finalUrl; }
+        $json = json_decode($response, true);
+        if (isset($json['error'])) { $detail .= ' error=' . $json['error']; }
+        if (isset($json['error_description'])) { $detail .= ' desc=' . $json['error_description']; }
+        error_log("[PAYPAL OAUTH] Fail $detail body: $snippet");
+        if (in_array($httpCode, [301,302])) {
+            $detail .= ' (verifica base_api: debe ser https://api-m.sandbox.paypal.com ó https://api-m.paypal.com)';
+        }
+        throw new Exception('Error al obtener token de PayPal (' . $detail . ')');
     }
     
     $data = json_decode($response, true);
@@ -54,13 +100,18 @@ function getPayPalAccessToken() {
         'expires' => $expires
     ];
     
-    // Crear directorio de cache si no existe
-    $cacheDir = dirname($cacheFile);
-    if (!is_dir($cacheDir)) {
-        mkdir($cacheDir, 0755, true);
+    // Intentar guardar cache; si falla continuar sin cache
+    $written = @file_put_contents($cacheFile, json_encode($cacheData));
+    $fileCached = true;
+    if ($written === false) {
+        $fileCached = false;
+        error_log('[PAYPAL OAUTH] No se pudo escribir cache token en '.$cacheFile.' (permiso denegado). Continuando sin cache (se usará sesión).');
     }
-    
-    file_put_contents($cacheFile, json_encode($cacheData));
+
+    // Guardar también en sesión como fallback (aunque file cache funcione, acelera)
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        $_SESSION['paypal_token'] = $cacheData;
+    }
     
     return $data['access_token'];
 }
@@ -69,7 +120,7 @@ function getPayPalAccessToken() {
  * Realizar petición a PayPal API
  */
 function paypalApiRequest($endpoint, $data = null, $method = 'GET') {
-    $config = require_once __DIR__ . '/../../secure/config.php';
+    $config = config();
     $paypalConfig = $config['paypal'];
     $accessToken = getPayPalAccessToken();
     
@@ -117,7 +168,7 @@ function paypalApiRequest($endpoint, $data = null, $method = 'GET') {
  * Crear orden en PayPal
  */
 function createPayPalOrder($amount, $currency = 'MXN', $description = '') {
-    $config = require_once __DIR__ . '/../../secure/config.php';
+    $config = config();
     
     $orderData = [
         'intent' => 'CAPTURE',
@@ -127,7 +178,7 @@ function createPayPalOrder($amount, $currency = 'MXN', $description = '') {
                     'currency_code' => $currency,
                     'value' => number_format($amount / 100, 2, '.', '')
                 ],
-                'description' => $description ?: 'Curso de Ganadería Regenerativa'
+                'description' => $description ?: courseTitle()
             ]
         ],
         'application_context' => [

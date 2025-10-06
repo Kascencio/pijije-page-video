@@ -19,7 +19,25 @@ if (!function_exists('csp_send_headers')) {
       ? 'https://api-m.paypal.com'
       : 'https://api-m.sandbox.paypal.com';
 
-    header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-{$nonce}' https://www.paypal.com; frame-src https://www.paypal.com https://drive.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' {$paypal_api}; base-uri 'self'; frame-ancestors 'none'");
+  // Ajuste CSP: permitir Tailwind CDN y estilos generados. Usar hashes sería más estricto, pero aquí habilitamos dominios necesarios.
+  // PayPal Smart Buttons requiere (según entorno):
+  // - Script: https://www.paypal.com (SDK principal)
+  // - Frame: https://www.paypal.com y/o https://www.sandbox.paypal.com
+  // - Imágenes/logos: https://www.paypalobjects.com
+  // - Conexiones XHR/fetch: api-m.sandbox.paypal.com o api-m.paypal.com y a veces dominios www.* para métricas
+  $paypalScriptSrc = "https://www.paypal.com https://cdn.tailwindcss.com"; // ya incluye tailwind
+  $paypalFrameSrc  = "https://www.paypal.com https://www.sandbox.paypal.com https://drive.google.com"; // incluir ambos para flexibilidad
+  $paypalImgSrc    = "'self' data: blob: https://www.paypalobjects.com https://www.paypal.com https://www.sandbox.paypal.com";
+  $paypalConnect   = "'self' https://api-m.paypal.com https://api-m.sandbox.paypal.com https://www.paypal.com https://www.sandbox.paypal.com";
+  header("Content-Security-Policy: "
+    . "default-src 'self'; "
+    . "script-src 'self' 'nonce-{$nonce}' {$paypalScriptSrc}; "
+    . "frame-src {$paypalFrameSrc}; "
+    . "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.tailwindcss.com; "
+    . "font-src 'self' https://fonts.gstatic.com data:; "
+    . "img-src {$paypalImgSrc}; "
+    . "connect-src {$paypalConnect}; "
+    . "base-uri 'self'; frame-ancestors 'none'");
     header('X-Frame-Options: DENY');
     header('X-Content-Type-Options: nosniff');
     header('Referrer-Policy: strict-origin-when-cross-origin');

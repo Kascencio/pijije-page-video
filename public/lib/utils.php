@@ -27,6 +27,67 @@ function formatPrice($cents, $currency = 'MXN') {
     return '$' . number_format($amount, 2) . ' ' . $currency;
 }
 
+/** Obtener course id principal desde config */
+function courseId() {
+    $cfg = config();
+    return (int)($cfg['app']['course_id'] ?? 1);
+}
+
+/** Migraciones ligeras runtime (solo en entorno no live) */
+if (!function_exists('runLightMigrations')) {
+    function runLightMigrations() {
+        static $done = false; if ($done) return; $done = true;
+        try {
+            $cfg = config();
+            $isLive = ($cfg['env'] ?? 'sandbox') === 'live';
+            if ($isLive) return; // solo en dev/sandbox
+            $db = getDB();
+            // users.active
+            $col = $db->fetchOne("SHOW COLUMNS FROM users LIKE 'active'");
+            if (!$col) {
+                $db->query('ALTER TABLE users ADD COLUMN active TINYINT(1) NOT NULL DEFAULT 1 AFTER pass_hash');
+                error_log('[MIGRATION] Añadida columna users.active');
+            }
+            // videos.course_id
+            $col = $db->fetchOne("SHOW COLUMNS FROM videos LIKE 'course_id'");
+            if (!$col) {
+                $db->query('ALTER TABLE videos ADD COLUMN course_id INT NOT NULL DEFAULT 1 AFTER id');
+                $db->query('UPDATE videos SET course_id = 1 WHERE course_id = 0 OR course_id IS NULL');
+                error_log('[MIGRATION] Añadida columna videos.course_id');
+            }
+            // Asegurar tabla user_access (por si en una instalación antigua no existe)
+            $tbl = $db->fetchOne("SHOW TABLES LIKE 'user_access'");
+            if (!$tbl) {
+                $db->query("CREATE TABLE user_access (\n  id INT AUTO_INCREMENT PRIMARY KEY,\n  user_id INT NOT NULL,\n  course_id INT NOT NULL,\n  granted_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n  UNIQUE KEY uq_user_course (user_id, course_id),\n  INDEX idx_course_id (course_id),\n  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+                error_log('[MIGRATION] Creada tabla user_access');
+            } else {
+                // Asegurar columnas mínimas
+                $col = $db->fetchOne("SHOW COLUMNS FROM user_access LIKE 'course_id'");
+                if (!$col) {
+                    $db->query("ALTER TABLE user_access ADD COLUMN course_id INT NOT NULL DEFAULT 1 AFTER user_id");
+                    $db->query("ALTER TABLE user_access ADD UNIQUE KEY uq_user_course (user_id, course_id)");
+                    error_log('[MIGRATION] Ajustada tabla user_access (course_id)');
+                }
+                // Añadir expires_at si no existe
+                $col = $db->fetchOne("SHOW COLUMNS FROM user_access LIKE 'expires_at'");
+                if (!$col) {
+                    $db->query("ALTER TABLE user_access ADD COLUMN expires_at DATETIME NULL AFTER granted_at");
+                    error_log('[MIGRATION] Añadida columna user_access.expires_at');
+                }
+            }
+            // Asegurar tabla user_video_progress
+            $tbl = $db->fetchOne("SHOW TABLES LIKE 'user_video_progress'");
+            if (!$tbl) {
+                $db->query("CREATE TABLE user_video_progress (\n  id INT AUTO_INCREMENT PRIMARY KEY,\n  user_id INT NOT NULL,\n  video_id INT NOT NULL,\n  seconds INT NOT NULL DEFAULT 0,\n  duration INT NULL,\n  completed_at DATETIME NULL,\n  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\n  UNIQUE KEY uq_user_video (user_id, video_id),\n  INDEX idx_user (user_id),\n  INDEX idx_video (video_id),\n  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,\n  FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+                error_log('[MIGRATION] Creada tabla user_video_progress');
+            }
+        } catch (Throwable $e) {
+            error_log('[MIGRATION] Error: '.$e->getMessage());
+        }
+    }
+    runLightMigrations();
+}
+
 /**
  * Generar mensaje flash (acepta ambas firmas):
  * setFlash('Mensaje', 'success') ó setFlash('success', 'Mensaje')
@@ -94,8 +155,9 @@ function redirectBack($fallback = '/') {
  * Obtener URL base de la aplicación
  */
 function getBaseUrl() {
-    $config = require_once __DIR__ . '/../../secure/config.php';
-    return rtrim($config['app']['base_url'], '/');
+    // Usar config() que cachea correctamente. OJO: require_once devolvía bool en subsiguientes llamadas
+    $cfg = config();
+    return rtrim($cfg['app']['base_url'], '/');
 }
 
 /**
@@ -105,8 +167,136 @@ function config() {
     static $config = null;
     if ($config === null) {
         $config = require __DIR__ . '/../../secure/config.php';
+        // Fusionar overrides desde system_config si la tabla existe
+        try {
+            $db = getDB();
+            $tbl = $db->fetchOne("SHOW TABLES LIKE 'system_config'");
+            if ($tbl) {
+                $rows = $db->fetchAll('SELECT config_key, config_value FROM system_config');
+                $map = [];
+                foreach ($rows as $r) { $map[$r['config_key']] = $r['config_value']; }
+                // Override de precio (centavos)
+                if (isset($map['course_price']) && is_numeric($map['course_price'])) {
+                    $config['app']['amount'] = (int)$map['course_price'];
+                }
+                if (!empty($map['course_title'])) {
+                    $config['app']['course_title'] = $map['course_title'];
+                }
+                if (!empty($map['course_description'])) {
+                    $config['app']['course_description'] = $map['course_description'];
+                }
+                if (isset($map['course_duration']) && is_numeric($map['course_duration'])) {
+                    $config['app']['course_duration_months'] = (int)$map['course_duration'];
+                }
+                if (!empty($map['paypal_client_id'])) {
+                    $cid = trim($map['paypal_client_id']);
+                    // Quitar espacios internos extremos accidentales (no alterar intencionalmente el valor)
+                    $config['paypal']['client_id'] = $cid;
+                }
+                if (isset($map['paypal_secret']) && $map['paypal_secret'] !== '') {
+                    // Permitir formato cifrado con prefijo enc:
+                    $secretRaw = $map['paypal_secret'];
+                    if (str_starts_with($secretRaw, 'enc:')) {
+                        $dec = decryptAppSecret(substr($secretRaw, 4));
+                        if ($dec !== null) {
+                            $secretRaw = $dec;
+                        } else {
+                            error_log('[CONFIG MERGE] No se pudo descifrar paypal_secret (¿APP_KEY cambió?).');
+                            // Forzar que se considere incompleto en lugar de usar texto cifrado inválido
+                            $secretRaw = '';
+                        }
+                    }
+                    $config['paypal']['secret'] = $secretRaw;
+                }
+                // Permitir override futuro del dominio base_api si se agrega campo en settings
+                if (!empty($map['paypal_base_api'])) {
+                    $config['paypal']['base_api'] = trim($map['paypal_base_api']);
+                }
+                // Potenciales futuras claves: paypal_secret, contact_email, etc.
+            }
+        } catch (Throwable $e) {
+            // Silencioso: no romper app si no existe tabla
+            error_log('[CONFIG MERGE] '.$e->getMessage());
+        }
+        // Normalización defensiva de base_api (corrige dominios comunes incorrectos)
+        if (!empty($config['paypal']['base_api'])) {
+            $base = rtrim($config['paypal']['base_api'], '/');
+            if (preg_match('~^https://sandbox\.paypal\.com$~i', $base) || preg_match('~^https://www\.sandbox\.paypal\.com$~i', $base)) {
+                error_log('[CONFIG] Corrigiendo base_api inválida (sandbox.paypal.com) -> api-m.sandbox.paypal.com');
+                $base = 'https://api-m.sandbox.paypal.com';
+            } elseif (preg_match('~^https://www\.paypal\.com$~i', $base)) {
+                error_log('[CONFIG] Corrigiendo base_api inválida (www.paypal.com) -> api-m.paypal.com');
+                $base = 'https://api-m.paypal.com';
+            }
+            $config['paypal']['base_api'] = $base;
+        }
     }
     return $config;
+}
+
+// --- Secret encryption helpers (opcional) ---
+if (!function_exists('getAppKey')) {
+    function getAppKey() {
+        return $_ENV['APP_KEY'] ?? getenv('APP_KEY') ?: null;
+    }
+}
+if (!function_exists('encryptAppSecret')) {
+    function encryptAppSecret($plain) {
+        $key = getAppKey();
+        if (!$key || !extension_loaded('sodium')) return null;
+        $keyBin = substr(hash('sha256', $key, true), 0, SODIUM_CRYPTO_SECRETBOX_KEYBYTES);
+        $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+        $cipher = sodium_crypto_secretbox($plain, $nonce, $keyBin);
+        return base64_encode($nonce . $cipher);
+    }
+}
+if (!function_exists('decryptAppSecret')) {
+    function decryptAppSecret($encoded) {
+        $key = getAppKey();
+        if (!$key || !extension_loaded('sodium')) return null;
+        $raw = base64_decode($encoded, true);
+        if ($raw === false) return null;
+        $nonceSize = SODIUM_CRYPTO_SECRETBOX_NONCEBYTES;
+        $nonce = substr($raw, 0, $nonceSize);
+        $cipher = substr($raw, $nonceSize);
+        $keyBin = substr(hash('sha256', $key, true), 0, SODIUM_CRYPTO_SECRETBOX_KEYBYTES);
+        $plain = @sodium_crypto_secretbox_open($cipher, $nonce, $keyBin);
+        return $plain === false ? null : $plain;
+    }
+}
+
+// Helpers específicos de curso
+if (!function_exists('courseTitle')) {
+    function courseTitle() {
+        $cfg = config();
+        return $cfg['app']['course_title'] ?? 'Curso';
+    }
+}
+if (!function_exists('courseDescription')) {
+    function courseDescription() {
+        $cfg = config();
+        return $cfg['app']['course_description'] ?? '';
+    }
+}
+if (!function_exists('coursePriceCents')) {
+    function coursePriceCents() {
+        $cfg = config();
+        return (int)($cfg['app']['amount'] ?? 0);
+    }
+}
+if (!function_exists('coursePriceFormatted')) {
+    function coursePriceFormatted() {
+        $cents = coursePriceCents();
+        $cfg = config();
+        $currency = $cfg['app']['currency'] ?? 'MXN';
+        return formatPrice($cents, $currency);
+    }
+}
+if (!function_exists('courseDurationMonths')) {
+    function courseDurationMonths() {
+        $cfg = config();
+        return (int)($cfg['app']['course_duration_months'] ?? ($cfg['app']['course_duration'] ?? 0));
+    }
 }
 
 /**
@@ -116,6 +306,26 @@ function url($path = '') {
     $baseUrl = getBaseUrl();
     $path = ltrim($path, '/');
     return $path ? "{$baseUrl}/{$path}" : $baseUrl;
+}
+
+/**
+ * Helper para construir URLs del panel admin respetando base_url
+ * Ej: adminUrl('users/index.php') => http://localhost/cursos/public/admin/users/index.php
+ */
+if (!function_exists('adminUrl')) {
+    function adminUrl($path = '') {
+        $path = ltrim($path, '/');
+        return url('admin/' . $path);
+    }
+}
+
+/**
+ * URL para assets estáticos respetando base_url
+ */
+if (!function_exists('asset')) {
+    function asset($path) {
+        return url($path);
+    }
 }
 
 /**
@@ -158,27 +368,69 @@ function generateToken($length = 32) {
  * Hash de contraseña
  */
 function hashPassword($password) {
-    return password_hash($password, PASSWORD_ARGON2ID, [
-        'memory_cost' => 65536, // 64 MB
-        'time_cost' => 4,       // 4 iteraciones
-        'threads' => 3,         // 3 hilos
-    ]);
+    // Evitar referenciar directamente la constante si no existe (causa fatal error)
+    if (defined('PASSWORD_ARGON2ID')) {
+        $algo = PASSWORD_ARGON2ID;
+        $options = [
+            'memory_cost' => 1 << 16, // 65536
+            'time_cost' => 4,
+            'threads' => 2,
+        ];
+    } else {
+        $algo = PASSWORD_BCRYPT; // fallback seguro
+        $options = ['cost' => 12];
+    }
+
+    $hash = password_hash($password, $algo, $options);
+    if ($hash === false) {
+        error_log('[PASSWORD] Falló password_hash() usando algoritmo: ' . $algo);
+        throw new RuntimeException('No se pudo generar hash de la contraseña');
+    }
+    return $hash;
 }
 
 /**
  * Verificar contraseña
  */
 function verifyPassword($password, $hash) {
-    return password_verify($password, $hash);
+    if (!password_verify($password, $hash)) {
+        return false;
+    }
+    // Opcional: rehash si ahora hay un algoritmo más fuerte disponible
+    if (defined('PASSWORD_ARGON2ID') && password_needs_rehash($hash, PASSWORD_ARGON2ID, [
+        'memory_cost' => 1<<16,
+        'time_cost' => 4,
+        'threads' => 2,
+    ])) {
+        try {
+            $newHash = hashPassword($password);
+            // Guardar en BD si tenemos contexto de usuario (no aquí para mantener pureza)
+        } catch (Exception $e) {
+            // Silencioso: no crítico
+        }
+    }
+    return true;
+}
+
+/**
+ * Información del algoritmo de password en runtime (debug opcional)
+ */
+function passwordAlgoInfo() : array {
+    $algo = defined('PASSWORD_ARGON2ID') ? 'argon2id' : 'bcrypt';
+    $info = ['algo' => $algo];
+    if ($algo === 'bcrypt') {
+        $info['note'] = 'Argon2ID no disponible en esta build de PHP; usando BCRYPT.';
+    }
+    return $info;
 }
 
 /**
  * Validar política de contraseña
  */
 function validatePasswordPolicy($password) {
-    $config = require_once __DIR__ . '/../../secure/config.php';
-    $minLength = $config['security']['password_min_length'];
-    $requirements = $config['security']['password_require'];
+    $cfg = config();
+    $minLength = $cfg['security']['password_min_length'];
+    $requirements = $cfg['security']['password_require'];
     
     if (strlen($password) < $minLength) {
         return "La contraseña debe tener al menos {$minLength} caracteres";
@@ -337,6 +589,13 @@ if (!function_exists('db')) {
     }
 }
 
+// Determinar si la petición es AJAX (fallback simple)
+if (!function_exists('isAjax')) {
+    function isAjax(): bool {
+        return isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+    }
+}
+
 // Helpers de PayPal
 if (!function_exists('paypal_access_token')) {
     function paypal_access_token() {
@@ -347,7 +606,8 @@ if (!function_exists('paypal_access_token')) {
 if (!function_exists('paypal_api')) {
     function paypal_api($method, $url, $data = null, $token = null) {
         if (!$token) $token = paypal_access_token();
-        
+
+        $method = strtoupper($method);
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -356,26 +616,41 @@ if (!function_exists('paypal_api')) {
             'Authorization: Bearer ' . $token,
             'Prefer: return=representation'
         ]);
-        
-        if ($method === 'POST' && $data) {
+
+        // Asegurar que POST se envíe como POST aunque no haya body (capture no requiere payload)
+        if ($method === 'POST') {
             curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+            if ($data !== null) {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+            }
+        } elseif ($method === 'PATCH') {
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PATCH');
+            if ($data !== null) {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+            }
+        } elseif ($method !== 'GET') {
+            // Otros métodos si eventualmente se usan
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+            if ($data !== null) {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+            }
         }
-        
+
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        
+
         if ($httpCode >= 400) {
             throw new Exception("PayPal API error: HTTP $httpCode - $response");
         }
-        
+
         return json_decode($response, true);
     }
 }
 
-if (!function_exists('grantAccess')) {
-    function grantAccess($pdo, $userId, $courseId) {
+// Renombrado: grantAccessDirect para no colisionar con grantAccess() de access.php
+if (!function_exists('grantAccessDirect')) {
+    function grantAccessDirect($pdo, $userId, $courseId) {
         $stmt = $pdo->prepare('INSERT IGNORE INTO user_access (user_id, course_id) VALUES (?, ?)');
         return $stmt->execute([$userId, $courseId]);
     }
@@ -406,35 +681,25 @@ function isPost() {
  */
 function logSecurity($event, $details = '', $userId = null) {
     try {
-        $pdo = getDB();
-        
-        // Obtener IP real
+    $pdo = getDB()->getPdo();
+        if ($pdo === null) {
+            throw new RuntimeException('PDO no inicializado');
+        }
         $ip = getRealIp();
-        
-        // Si no se especifica userId, intentar obtenerlo de la sesión
         if ($userId === null) {
             $userId = getCurrentUserId();
         }
-        
-        // User agent
-        $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
-        
-        // Preparar consulta
+
+        // Ajustar a columnas reales del schema (id, user_id, ip_address, action, details JSON, created_at)
+        // Si el schema original tenía columnas diferentes, este insert debe alinearse a: security_logs(action, user_id, ip_address, details)
         $stmt = $pdo->prepare(
-            'INSERT INTO security_logs (user_id, event_type, ip_address, user_agent, details, created_at) 
-             VALUES (?, ?, ?, ?, ?, NOW())'
+            'INSERT INTO security_logs (action, user_id, ip_address, details, created_at) VALUES (?, ?, ?, ?, NOW())'
         );
-        
-        return $stmt->execute([
-            $userId,
-            $event,
-            $ip,
-            $userAgent,
-            $details
-        ]);
-        
+        if (is_array($details) || is_object($details)) {
+            $details = json_encode($details, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
+        }
+        return $stmt->execute([$event, $userId, $ip, $details]);
     } catch (Exception $e) {
-        // En caso de error, log al error log del servidor
         error_log("Error logging security event: " . $e->getMessage());
         return false;
     }

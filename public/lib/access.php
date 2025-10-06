@@ -10,11 +10,14 @@
 function hasAccess($userId, $courseId) {
     $db = getDB();
     $access = $db->fetchOne(
-        'SELECT id FROM user_access WHERE user_id = ? AND course_id = ?',
+        'SELECT id, expires_at FROM user_access WHERE user_id = ? AND course_id = ?',
         [$userId, $courseId]
     );
-    
-    return (bool) $access;
+    if (!$access) return false;
+    if (!empty($access['expires_at']) && strtotime($access['expires_at']) < time()) {
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -22,20 +25,20 @@ function hasAccess($userId, $courseId) {
  */
 function grantAccess($userId, $courseId) {
     $db = getDB();
-    
     try {
-        // Usar INSERT ... ON DUPLICATE KEY UPDATE para evitar duplicados
+        $months = courseDurationMonths();
+        $grantedAt = now();
+        $expiresAt = $months > 0 ? date('Y-m-d H:i:s', strtotime("+$months months")) : null;
         $db->query(
-            'INSERT INTO user_access (user_id, course_id, granted_at) VALUES (?, ?, ?)
-             ON DUPLICATE KEY UPDATE granted_at = VALUES(granted_at)',
-            [$userId, $courseId, now()]
+            'INSERT INTO user_access (user_id, course_id, granted_at, expires_at) VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE granted_at = VALUES(granted_at), expires_at = VALUES(expires_at)',
+            [$userId, $courseId, $grantedAt, $expiresAt]
         );
-        
         logSecurity('access_granted', [
             'user_id' => $userId,
-            'course_id' => $courseId
+            'course_id' => $courseId,
+            'expires_at' => $expiresAt
         ]);
-        
         return true;
     } catch (Exception $e) {
         error_log("Grant access failed: " . $e->getMessage());
@@ -73,7 +76,7 @@ function revokeAccess($userId, $courseId) {
 function getUserCourses($userId) {
     $db = getDB();
     return $db->fetchAll(
-        'SELECT ua.course_id, ua.granted_at, c.title as course_title
+        'SELECT ua.course_id, ua.granted_at, ua.expires_at, c.title as course_title
          FROM user_access ua
          LEFT JOIN courses c ON ua.course_id = c.id
          WHERE ua.user_id = ?
@@ -85,7 +88,7 @@ function getUserCourses($userId) {
 /**
  * Verificar acceso y redirigir si no tiene permisos
  */
-function requireCourseAccess($userId, $courseId, $redirectTo = '/') {
+function requireCourseAccess($userId, $courseId, $redirectTo = '/no-acceso.php') {
     if (!hasAccess($userId, $courseId)) {
         setFlash('No tienes acceso a este curso. Completa tu compra para acceder.', 'error');
         redirect($redirectTo);
@@ -121,7 +124,9 @@ function getAccessStats($courseId) {
         'SELECT 
             COUNT(*) as total_access,
             COUNT(DISTINCT ua.user_id) as unique_users,
-            MAX(ua.granted_at) as last_access_granted
+            SUM(CASE WHEN ua.expires_at IS NULL OR ua.expires_at > NOW() THEN 1 ELSE 0 END) as active_access,
+            MAX(ua.granted_at) as last_access_granted,
+            MAX(ua.expires_at) as last_expiration
          FROM user_access ua 
          WHERE ua.course_id = ?',
         [$courseId]

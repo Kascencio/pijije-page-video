@@ -19,10 +19,16 @@ if (!file_exists($configPath)) {
 
 $config = require $configPath;
 
-// Conectar a la base de datos
+// Intentar conectar; si la base no existe, crearla automáticamente
+$dsn = $config['db']['dsn'];
+preg_match('/host=([^;]+)/', $dsn, $mHost);
+preg_match('/dbname=([^;]+)/', $dsn, $mDb);
+$host = $mHost[1] ?? '127.0.0.1';
+$dbName = $mDb[1] ?? null;
+
 try {
     $pdo = new PDO(
-        $config['db']['dsn'],
+        $dsn,
         $config['db']['user'],
         $config['db']['pass'],
         [
@@ -32,7 +38,33 @@ try {
     );
     echo "✅ Conexión a base de datos exitosa\n";
 } catch (PDOException $e) {
-    die("❌ Error de conexión: " . $e->getMessage() . "\n");
+    if ($dbName && stripos($e->getMessage(), 'Unknown database') !== false) {
+        echo "⚠️  Base de datos '{$dbName}' no existe. Creando...\n";
+        try {
+            $pdoTmp = new PDO(
+                "mysql:host={$host};charset=utf8mb4",
+                $config['db']['user'],
+                $config['db']['pass'],
+                [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+            );
+            $pdoTmp->exec("CREATE DATABASE `{$dbName}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;");
+            echo "✅ Base creada. Reintentando conexión...\n";
+            $pdo = new PDO(
+                $dsn,
+                $config['db']['user'],
+                $config['db']['pass'],
+                [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
+                ]
+            );
+            echo "✅ Conexión ahora exitosa\n";
+        } catch (PDOException $e2) {
+            die("❌ No se pudo crear/conectar DB: " . $e2->getMessage() . "\n");
+        }
+    } else {
+        die("❌ Error de conexión: " . $e->getMessage() . "\n" . "Verifica host, puerto, usuario y contraseña.\n");
+    }
 }
 
 // Verificar si las tablas ya existen

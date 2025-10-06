@@ -11,13 +11,48 @@ $admin = getCurrentAdmin();
 // Procesar formulario de configuración
 if (isPost()) {
     validateCsrfRequest();
-    
     $configs = $_POST['config'] ?? [];
-    
-    foreach ($configs as $key => $value) {
-        updateSystemConfig($key, $value);
+    // Restringir edición de credenciales sensibles a super_admin
+    $isSuper = (getCurrentAdmin()['role'] ?? '') === 'super_admin';
+    if (!$isSuper) {
+        unset($configs['paypal_secret']);
     }
-    
+    if (array_key_exists('paypal_secret', $configs) && trim($configs['paypal_secret']) === '') {
+        unset($configs['paypal_secret']);
+    } elseif (array_key_exists('paypal_secret', $configs) && trim($configs['paypal_secret']) !== '') {
+        // Intentar cifrado si disponible
+        $enc = encryptAppSecret($configs['paypal_secret']);
+        if ($enc) {
+            $configs['paypal_secret'] = 'enc:' . $enc;
+        }
+    }
+    foreach ($configs as $key => $value) {
+        // Evitar loguear valores completos de secretos
+        if ($key === 'paypal_secret') {
+            $masked = substr(hash('sha256', $value), 0, 12);
+            updateSystemConfig($key, $value);
+            logAdminAction('config_update_masked', 'config', null, ['key'=>$key,'hash_prefix'=>$masked]);
+        } else {
+            updateSystemConfig($key, $value);
+        }
+    }
+    // Después de guardar, ejecutar acciones especiales si se solicitaron
+    if (isset($_POST['action']) && $_POST['action'] === 'regen_paypal_token') {
+        $cacheFile = __DIR__ . '/../../../secure/cache/paypal_token.json';
+        if (file_exists($cacheFile)) { @unlink($cacheFile); }
+        setFlash('success', 'Configuración guardada y cache de token PayPal eliminada.');
+        redirect('/admin/settings/index.php');
+    }
+    if (isset($_POST['action']) && $_POST['action'] === 'test_paypal') {
+        try {
+            $token = getPayPalAccessToken();
+            $prefix = substr($token, 0, 8);
+            setFlash('success', 'Configuración guardada. Conexión PayPal OK (token prefix: ' . escape($prefix) . ')');
+        } catch (Throwable $e) {
+            setFlash('error', 'Configuración guardada pero fallo test PayPal: ' . $e->getMessage());
+        }
+        redirect('/admin/settings/index.php');
+    }
     setFlash('success', 'Configuración actualizada exitosamente');
     redirect('/admin/settings/index.php');
 }
@@ -372,7 +407,7 @@ $flash = getFlash();
             </div>
             
             <nav class="sidebar-nav">
-                <a href="/admin/dashboard/index.php" class="nav-item">
+                <a href="<?= adminUrl('dashboard/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2H5a2 2 0 00-2-2z"/>
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5a2 2 0 012-2h4a2 2 0 012 2v2H8V5z"/>
@@ -380,28 +415,28 @@ $flash = getFlash();
                     Dashboard
                 </a>
                 
-                <a href="/admin/users/index.php" class="nav-item">
+                <a href="<?= adminUrl('users/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"/>
                     </svg>
                     Usuarios
                 </a>
                 
-                <a href="/admin/videos/index.php" class="nav-item">
+                <a href="<?= adminUrl('videos/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                     </svg>
                     Videos
                 </a>
                 
-                <a href="/admin/payments/index.php" class="nav-item">
+                <a href="<?= adminUrl('payments/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"/>
                     </svg>
                     Pagos
                 </a>
                 
-                <a href="/admin/settings/index.php" class="nav-item active">
+                <a href="<?= adminUrl('settings/index.php') ?>" class="nav-item active">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
@@ -465,7 +500,7 @@ $flash = getFlash();
                                     <label class="form-label">Precio del Curso (centavos)</label>
                                     <input type="number" name="config[course_price]" class="form-input" 
                                            value="<?= escape($config['course_price'] ?? '') ?>" required>
-                                    <div class="form-help">Ejemplo: 150000 = $1,500.00 MXN</div>
+                                    <div class="form-help">Ejemplo: 150000 = $1,500.00 MXN <span id="pricePreview" style="font-weight:600;color:#1e3a8a;margin-left:6px;"></span></div>
                                 </div>
                                 
                                 <div class="form-group">
@@ -485,14 +520,64 @@ $flash = getFlash();
                             <p class="section-description">Credenciales y configuración de pagos</p>
                         </div>
                         <div class="section-content">
+                            <?php $hasSecret = !empty($config['paypal_secret']); ?>
                             <div class="form-group">
                                 <label class="form-label">Client ID de PayPal</label>
-                                <input type="text" name="config[paypal_client_id]" class="form-input" 
-                                       value="<?= escape($config['paypal_client_id'] ?? '') ?>">
-                                <div class="form-help">ID público de tu aplicación PayPal</div>
+                                <input type="text" name="config[paypal_client_id]" class="form-input" value="<?= escape($config['paypal_client_id'] ?? '') ?>" required>
+                                <div class="form-help">ID público (sandbox o live) de la app en PayPal Developer Dashboard.</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Secret de PayPal <?= $hasSecret ? '<span style=\'color:#16a34a;font-size:12px;\'>(definido)</span>' : '' ?></label>
+                                <input type="password" name="config[paypal_secret]" class="form-input" value="" placeholder="••••••••" autocomplete="off">
+                                <div class="form-help">Déjalo vacío si no deseas reemplazar el actual. Se cifra si hay APP_KEY y sodium.</div>
+                            </div>
+                            <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                                <button type="submit" name="action" value="regen_paypal_token" class="form-input" style="cursor:pointer;background:#1e3a8a;color:#fff;font-weight:500;width:auto;">Regenerar Token OAuth Cache</button>
+                                <button type="submit" name="action" value="test_paypal" class="form-input" style="cursor:pointer;background:#166534;color:#fff;font-weight:500;width:auto;">Probar Conexión PayPal</button>
+                                <span class="form-help" style="flex-basis:100%;">Regenerar borra el token en cache; Probar intenta autenticarse ahora.</span>
                             </div>
                             
                             <!-- Hosted Button ID removido - ahora usamos Smart Buttons -->
+                        </div>
+                    </div>
+
+                    <!-- PayPal Diagnóstico -->
+                    <?php 
+                        $cfgMerged = config();
+                        $cid = $cfgMerged['paypal']['client_id'] ?? '';
+                        $sec = $cfgMerged['paypal']['secret'] ?? '';
+                        $cidPrefix = $cid ? substr($cid,0,10) . (strlen($cid)>10?'…':'') : '—';
+                        $secLen = $sec ? strlen($sec) : 0;
+                        $secHash = $secLen ? substr(hash('sha256',$sec),0,12) : '—';
+                        $isEncrypted = isset($config['paypal_secret']) && str_starts_with($config['paypal_secret'],'enc:');
+                        $cacheFile = __DIR__ . '/../../../secure/cache/paypal_token.json';
+                        $cacheInfo = (file_exists($cacheFile)) ? ('sí (' . date('Y-m-d H:i:s', filemtime($cacheFile)) . ')') : 'no';
+                        // Diagnóstico extendido de caché
+                        $sessionCache = (session_status() === PHP_SESSION_ACTIVE && !empty($_SESSION['paypal_token'])) ? 'sí' : 'no';
+                        $sessionExpiry = ($sessionCache === 'sí') ? ('expira ' . date('H:i:s', $_SESSION['paypal_token']['expires'])) : '—';
+                        // Deducir ruta fallback real (replica de la lógica en paypal.php)
+                        $primaryCacheDir = realpath(__DIR__ . '/../../../secure/cache') ?: (__DIR__ . '/../../../secure/cache');
+                        $primaryWritable = is_dir($primaryCacheDir) && is_writable($primaryCacheDir);
+                        $effectiveCacheDir = $primaryWritable ? $primaryCacheDir : sys_get_temp_dir();
+                        $effectiveWritable = is_writable($effectiveCacheDir) ? 'sí' : 'no';
+                        $cacheMode = $sessionCache === 'sí' ? 'sesión' : ($primaryWritable ? 'archivo' : 'temp/sin-escritura');
+                    ?>
+                    <div class="settings-section">
+                        <div class="section-header">
+                            <h3 class="section-title">Diagnóstico PayPal</h3>
+                            <p class="section-description">Datos para depuración (sin exponer secretos)</p>
+                        </div>
+                        <div class="section-content" style="font-family:monospace;font-size:13px;line-height:1.5;">
+<div><strong>Entorno:</strong> <?= escape($cfgMerged['env'] ?? 'n/a') ?></div>
+<div><strong>Base API:</strong> <?= escape($cfgMerged['paypal']['base_api'] ?? 'n/a') ?></div>
+<div><strong>Client ID prefix:</strong> <?= escape($cidPrefix) ?> (len <?= strlen($cid) ?>)</div>
+<div><strong>Secret hash prefix (sha256):</strong> <?= escape($secHash) ?> (len <?= $secLen ?><?= $isEncrypted?'; cifrado':' ' ?>)</div>
+<div><strong>Cache token:</strong> <?= escape($cacheInfo) ?></div>
+<div><strong>Cache modo:</strong> <?= escape($cacheMode) ?> (ruta: <?= escape($effectiveCacheDir) ?> / writable: <?= $effectiveWritable ?>)</div>
+<div><strong>Cache en sesión:</strong> <?= escape($sessionCache) ?> <?= $sessionExpiry ? '('.escape($sessionExpiry).')':'' ?></div>
+<div><strong>APP_KEY activo:</strong> <?= getenv('APP_KEY') ? 'sí' : 'no' ?></div>
+<div style="margin-top:8px;color:#64748b;">Si el hash no cambia tras guardar un nuevo secret, la actualización no se está persistiendo.</div>
+<div style="margin-top:4px;color:#b45309;">401 invalid_client = credenciales incorrectas (app sandbox vs live, secret regenerado o copiado incompleto).</div>
                         </div>
                     </div>
                     
@@ -588,6 +673,34 @@ $flash = getFlash();
                     </button>
                 </div>
             </form>
+            <script nonce="<?= e(csp_nonce()) ?>">
+            (function(){
+               const input = document.querySelector('input[name="config[course_price]"]');
+               const prev = document.getElementById('pricePreview');
+               if(!input||!prev) return;
+               function fmt(v){
+                   if(!v || isNaN(v) || v<=0) return '';
+                   const pesos = (v/100).toLocaleString('es-MX', {style:'currency', currency:'MXN'});
+                   return '→ ' + pesos;
+               }
+               function update(){ prev.textContent = fmt(parseInt(input.value,10)); }
+               input.addEventListener('input', update); update();
+               // Validación mínima al enviar (evitar montos raros)
+               const form = input.closest('form');
+               if(form){
+                  form.addEventListener('submit', function(e){
+                      const val = parseInt(input.value,10);
+                      if(isNaN(val)||val<1000){
+                          e.preventDefault();
+                          alert('El precio debe ser al menos 1000 centavos ($10.00 MXN)');
+                      } else if(val>50000000){
+                          e.preventDefault();
+                          alert('El precio es demasiado alto. Revisa que escribiste centavos (ej: 150000 para $1500).');
+                      }
+                  });
+               }
+            })();
+            </script>
         </div>
     </div>
 </body>

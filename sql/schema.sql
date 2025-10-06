@@ -6,7 +6,7 @@ CREATE TABLE users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(100) NOT NULL,
   email VARCHAR(120) NOT NULL UNIQUE,
-  pass_hash CHAR(60) NOT NULL,
+  pass_hash VARCHAR(255) NOT NULL, -- soporte bcrypt y Argon2
   verified TINYINT(1) DEFAULT 1,
   login_attempts INT DEFAULT 0,
   locked_until DATETIME NULL,

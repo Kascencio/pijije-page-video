@@ -5,4 +5,4 @@ require_once __DIR__ . '/lib/bootstrap.php';
 logoutUser();
 
 // Redirigir al inicio
-redirect('/');
+redirect(''); // base URL

@@ -19,16 +19,19 @@ return [
 
   'db' => [
     // En macOS con XAMPP, '127.0.0.1' suele evitar temas de socket; usa tu usuario real
-    'dsn'  => 'mysql:host=127.0.0.1;dbname=cursos;charset=utf8mb4',
-    'user' => 'roo',       // en local puede ser 'root'
+    'dsn'  => 'mysql:host=localhost;dbname=cursos;charset=utf8mb4',
+    'user' => 'root',       // en local puede ser 'root'
     'pass' => '', // en local XAMPP suele ser ''
   ],
 
   'paypal' => [
     // SANDBOX: client_id real (no afecta seguridad, pero no lo comprometas en público)
-    'client_id' => 'BAAipD-neAwq8ipyuWBvR2fuwvHBZXSH01lloe6EczcKmt4VSmr_FdUCZ-2sWm7Hn1hGs_s0OZmXE7PTVI',
-    'secret'    => 'TU_SECRET_AQUI', // Pónlo de tu Dashboard Sandbox
-    'base_api'  => 'https://api-m.sandbox.paypal.com', // live: https://api-m.paypal.com
+    'client_id' => '',
+    'secret'    => '', // Pónlo de tu Dashboard Sandbox
+    // IMPORTANTE: Usa SIEMPRE el dominio de API REST:
+    // Sandbox correcto: https://api-m.sandbox.paypal.com (ANTES estaba mal: https://sandbox.paypal.com)
+    // Live correcto:    https://api-m.paypal.com
+    'base_api'  => 'https://api-m.sandbox.paypal.com', // cambiar a api-m.paypal.com en producción
     // Si vas a verificar firma del webhook, usa el webhook_id real del panel
     'webhook_id' => 'WEBHOOK_ID_OPCIONAL'
   ],

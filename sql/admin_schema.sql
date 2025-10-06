@@ -5,7 +5,7 @@ CREATE TABLE admins (
   id INT AUTO_INCREMENT PRIMARY KEY,
   username VARCHAR(50) NOT NULL UNIQUE,
   email VARCHAR(120) NOT NULL UNIQUE,
-  pass_hash CHAR(60) NOT NULL,
+  pass_hash VARCHAR(255) NOT NULL, -- soporta bcrypt (~60) y Argon2 (>90)
   role ENUM('super_admin', 'admin') DEFAULT 'admin',
   active TINYINT(1) DEFAULT 1,
   last_login DATETIME NULL,
@@ -48,9 +48,7 @@ CREATE TABLE admin_logs (
   INDEX idx_created_at (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Insertar admin por defecto (password: admin123)
-INSERT INTO admins (username, email, pass_hash, role) VALUES 
-('admin', 'admin@organicos.com', '$argon2id$v=19$m=65536,t=4,p=3$dGVzdA$test', 'super_admin');
+-- (El admin inicial ahora se crea mediante bin/init_admin.php para asegurar hashing correcto)
 
 -- Configuración inicial del sistema
 INSERT INTO system_config (config_key, config_value, description) VALUES

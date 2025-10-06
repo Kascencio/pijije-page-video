@@ -1,37 +1,52 @@
 <?php
 require_once __DIR__ . '/../../lib/bootstrap.php';
 require_once __DIR__ . '/../../lib/admin.php';
+require_once __DIR__ . '/../../lib/access.php';
 
 // Verificar acceso de administrador
 requireAdmin();
 requireAdminPermission('view_users');
+$cid = courseId();
 
 $admin = getCurrentAdmin();
 
 // Procesar acciones
+// Modo AJAX (si header Accept: application/json o query ajax=1)
+$isAjax = (!empty($_SERVER['HTTP_ACCEPT']) && str_contains($_SERVER['HTTP_ACCEPT'], 'application/json')) || (isset($_GET['ajax']) && $_GET['ajax']=='1');
+
 if (isPost()) {
     validateCsrfRequest();
-    
+
     $action = $_POST['action'] ?? '';
     $userId = (int)($_POST['user_id'] ?? 0);
-    
+    $result = ['success'=>false];
+    $exception = null;
+    try {
     switch ($action) {
         case 'grant_access':
             if (hasAdminPermission('edit_users')) {
-                grantAccess($userId, 1);
-                logAdminAction('grant_access', 'user', $userId, ['course_id' => 1]);
-                setFlash('success', 'Acceso concedido al usuario');
+                if (grantAccess($userId, $cid)) {
+                    logAdminAction('grant_access', 'user', $userId, ['course_id' => $cid]);
+                    $result = ['success'=>true,'message'=>'Acceso concedido','granted'=>true,'granted_at'=>now()];
+                    setFlash('success', 'Acceso concedido al usuario');
+                } else {
+                    $result['message'] = 'No se pudo conceder acceso';
+                }
             }
             break;
-            
+
         case 'revoke_access':
             if (hasAdminPermission('edit_users')) {
-                revokeAccess($userId, 1);
-                logAdminAction('revoke_access', 'user', $userId, ['course_id' => 1]);
-                setFlash('success', 'Acceso revocado al usuario');
+                if (revokeAccess($userId, $cid)) {
+                    logAdminAction('revoke_access', 'user', $userId, ['course_id' => $cid]);
+                    $result = ['success'=>true,'message'=>'Acceso revocado','granted'=>false];
+                    setFlash('success', 'Acceso revocado al usuario');
+                } else {
+                    $result['message'] = 'No se pudo revocar';
+                }
             }
             break;
-            
+
         case 'toggle_active':
             if (hasAdminPermission('edit_users')) {
                 $db = getDB();
@@ -39,18 +54,53 @@ if (isPost()) {
                 if ($user) {
                     $newStatus = $user['active'] ? 0 : 1;
                     $db->update('users', ['active' => $newStatus], 'id = ?', [$userId]);
-                    
+
                     logAdminAction('toggle_user_status', 'user', $userId, [
                         'new_status' => $newStatus ? 'active' : 'inactive'
                     ]);
-                    
+
                     setFlash('success', 'Estado del usuario actualizado');
+                    $result = ['success'=>true,'message'=>'Estado actualizado','active'=>$newStatus==1];
+                }
+            }
+            break;
+
+        case 'reset_password':
+            if (hasAdminPermission('edit_users')) {
+                $db = getDB();
+                $user = $db->fetchOne('SELECT id FROM users WHERE id = ?', [$userId]);
+                if ($user) {
+                    $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@$%&*+-_?';
+                    $len = 14; $bytes = random_bytes($len); $temp = '';
+                    for ($i=0; $i<$len; $i++) { $temp .= $chars[ord($bytes[$i]) % strlen($chars)]; }
+                    $hash = hashPassword($temp);
+                    $db->update('users', ['pass_hash' => $hash], 'id = ?', [$userId]);
+                    logAdminAction('reset_user_password', 'user', $userId, []); // no almacenar pass
+                    setFlash('success', 'Contraseña temporal: ' . $temp . ' (solicita al usuario cambiarla)');
+                    $result = ['success'=>true,'message'=>'Password reseteado','temp_password'=>$temp];
                 }
             }
             break;
     }
-    
-    redirect('/admin/users/index.php');
+    } catch (Throwable $e) {
+        $exception = $e;
+        error_log('[ADMIN USERS AJAX] Exception: '.$e->getMessage().' @ '.$e->getFile().':'.$e->getLine());
+        if (isDevelopment()) {
+            $result = [
+                'success' => false,
+                'message' => 'Excepción: '.$e->getMessage(),
+                'trace' => explode("\n", $e->getTraceAsString())
+            ];
+        } else {
+            $result = ['success'=>false,'message'=>'Error interno'];
+        }
+    }
+    if ($isAjax) {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode($result, JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    redirect('admin/users/index.php');
 }
 
 // Obtener parámetros de filtrado
@@ -71,9 +121,10 @@ if ($search) {
 }
 
 if ($filter === 'with_access') {
-    $whereConditions[] = 'id IN (SELECT user_id FROM user_access WHERE course_id = 1)';
+    // Usar la LEFT JOIN ya existente para determinar si tiene acceso
+    $whereConditions[] = 'ua.user_id IS NOT NULL';
 } elseif ($filter === 'without_access') {
-    $whereConditions[] = 'id NOT IN (SELECT user_id FROM user_access WHERE course_id = 1)';
+    $whereConditions[] = 'ua.user_id IS NULL';
 } elseif ($filter === 'active') {
     $whereConditions[] = 'active = 1';
 } elseif ($filter === 'inactive') {
@@ -84,23 +135,36 @@ $whereClause = $whereConditions ? 'WHERE ' . implode(' AND ', $whereConditions) 
 
 // Obtener usuarios
 $db = getDB();
-$users = $db->fetchAll(
-    "SELECT u.*, 
-     CASE WHEN ua.user_id IS NOT NULL THEN 1 ELSE 0 END as has_access,
-     ua.granted_at
-     FROM users u 
-     LEFT JOIN user_access ua ON u.id = ua.user_id AND ua.course_id = 1
-     $whereClause
-     ORDER BY u.created_at DESC 
-     LIMIT ? OFFSET ?",
-    array_merge($params, [$perPage, $offset])
-);
-
-// Contar total para paginación
-$totalCount = $db->fetchOne(
-    "SELECT COUNT(*) as count FROM users u $whereClause",
-    $params
-)['count'];
+try {
+    $limit = (int)$perPage; if($limit<=0||$limit>200) $limit=20;
+    $off = (int)$offset; if($off<0) $off=0;
+    $queryParams = array_merge([$cid], $params);
+    $sqlUsers = "SELECT u.*, 
+        CASE WHEN ua.user_id IS NOT NULL THEN 1 ELSE 0 END as has_access,
+        ua.granted_at
+        FROM users u 
+        LEFT JOIN user_access ua ON u.id = ua.user_id AND ua.course_id = ?
+        $whereClause
+        ORDER BY u.created_at DESC 
+        LIMIT $limit OFFSET $off";
+    $users = $db->fetchAll($sqlUsers, $queryParams);
+    // El conteo debe usar el mismo JOIN si el whereClause hace referencia a ua.
+    $countSql = "SELECT COUNT(*) as count FROM users u LEFT JOIN user_access ua ON u.id = ua.user_id AND ua.course_id = ? $whereClause";
+    $totalCount = $db->fetchOne($countSql, $queryParams)['count'];
+} catch (Throwable $e) {
+    error_log('[ADMIN USERS LIST] '.$e->getMessage());
+    if (isDevelopment()) {
+        echo '<pre style="padding:16px;background:#fee;color:#900;border:1px solid #f99;">';
+        echo "Error cargando usuarios: ".$e->getMessage()."\n";
+        echo htmlspecialchars($e->getTraceAsString());
+        echo '</pre>';
+    } else {
+        http_response_code(500);
+        echo 'Error interno cargando usuarios';
+    }
+    $users = [];
+    $totalCount = 0;
+}
 
 $totalPages = ceil($totalCount / $perPage);
 
@@ -447,6 +511,12 @@ $flash = getFlash();
         .btn-toggle:hover {
             background: #edf2f7;
         }
+        .btn-reset {
+            background: #fff7ed;
+            color: #9a3412;
+            border: 1px solid #fdba74;
+        }
+        .btn-reset:hover { background: #fed7aa; }
         
         /* Pagination */
         .pagination {
@@ -524,7 +594,7 @@ $flash = getFlash();
             </div>
             
             <nav class="sidebar-nav">
-                <a href="/admin/dashboard/index.php" class="nav-item">
+                <a href="<?= adminUrl('dashboard/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2H5a2 2 0 00-2-2z"/>
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5a2 2 0 012-2h4a2 2 0 012 2v2H8V5z"/>
@@ -532,28 +602,28 @@ $flash = getFlash();
                     Dashboard
                 </a>
                 
-                <a href="/admin/users/index.php" class="nav-item active">
+                <a href="<?= adminUrl('users/index.php') ?>" class="nav-item active">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"/>
                     </svg>
                     Usuarios
                 </a>
                 
-                <a href="/admin/videos/index.php" class="nav-item">
+                <a href="<?= adminUrl('videos/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                     </svg>
                     Videos
                 </a>
                 
-                <a href="/admin/payments/index.php" class="nav-item">
+                <a href="<?= adminUrl('payments/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"/>
                     </svg>
                     Pagos
                 </a>
                 
-                <a href="/admin/settings/index.php" class="nav-item">
+                <a href="<?= adminUrl('settings/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
@@ -563,7 +633,7 @@ $flash = getFlash();
             </nav>
             
             <div class="logout-section">
-                <form method="POST" action="/admin/logout.php" style="margin: 0;">
+                <form method="POST" action="<?= adminUrl('logout.php') ?>" style="margin: 0;">
                     <?= csrfInput() ?>
                     <button type="submit" class="logout-btn">
                         <svg style="width: 16px; height: 16px; margin-right: 8px; vertical-align: middle;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -655,34 +725,21 @@ $flash = getFlash();
                                 <?php endif; ?>
                             </td>
                             <td><?= formatAdminDate($user['created_at']) ?></td>
-                            <td><?= formatAdminDate($user['last_login']) ?></td>
+                            <td><?= isset($user['last_login']) ? formatAdminDate($user['last_login']) : '—' ?></td>
                             <td>
                                 <div class="action-buttons">
                                     <?php if (hasAdminPermission('edit_users')): ?>
-                                        <?php if ($user['has_access']): ?>
-                                            <form method="POST" style="display: inline;">
-                                                <?= csrfInput() ?>
-                                                <input type="hidden" name="action" value="revoke_access">
-                                                <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
-                                                <button type="submit" class="action-btn btn-revoke">Revocar</button>
-                                            </form>
-                                        <?php else: ?>
-                                            <form method="POST" style="display: inline;">
-                                                <?= csrfInput() ?>
-                                                <input type="hidden" name="action" value="grant_access">
-                                                <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
-                                                <button type="submit" class="action-btn btn-grant">Conceder</button>
-                                            </form>
-                                        <?php endif; ?>
-                                        
-                                        <form method="POST" style="display: inline;">
-                                            <?= csrfInput() ?>
-                                            <input type="hidden" name="action" value="toggle_active">
-                                            <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
-                                            <button type="submit" class="action-btn btn-toggle">
-                                                <?= $user['active'] ? 'Desactivar' : 'Activar' ?>
-                                            </button>
-                                        </form>
+                                        <button class="action-btn <?= $user['has_access'] ? 'btn-revoke':'btn-grant' ?>" 
+                                                data-action="<?= $user['has_access'] ? 'revoke_access':'grant_access' ?>" 
+                                                data-user="<?= $user['id'] ?>">
+                                            <?= $user['has_access'] ? 'Revocar':'Conceder' ?>
+                                        </button>
+                                        <button class="action-btn btn-toggle" data-action="toggle_active" data-user="<?= $user['id'] ?>">
+                                            <?= $user['active'] ? 'Desactivar' : 'Activar' ?>
+                                        </button>
+                                        <button class="action-btn btn-reset" data-action="reset_password" data-user="<?= $user['id'] ?>">
+                                            Reset Pass
+                                        </button>
                                     <?php endif; ?>
                                 </div>
                             </td>
@@ -718,5 +775,72 @@ $flash = getFlash();
             <?php endif; ?>
         </div>
     </div>
+<script nonce="<?= getNonce() ?>">
+(function(){
+        let csrfToken = '<?= generateCsrfToken() ?>';
+    function post(action,userId){
+     const form = new FormData();
+     form.append('action', action);
+     form.append('user_id', userId);
+        form.append('csrf_token', csrfToken);
+        return fetch(window.location.href + '?ajax=1', {
+                method:'POST',
+                headers:{'Accept':'application/json'},
+                credentials: 'same-origin',
+                body: form
+            }).then(async r=>{
+                if(r.status === 403){
+                     return {success:false,message:'CSRF inválido. Recarga la página.'};
+                }
+                if(!r.ok){
+                     return {success:false,message:'HTTP '+r.status};
+                }
+                return r.json();
+            }).catch(()=>({success:false,message:'Error de red'}));
+  }
+  function updateRow(btn,res){
+     if(!res.success) return;
+     const row = btn.closest('tr');
+     if(!row) return;
+     if(res.hasOwnProperty('granted')){
+         const accesoCell = row.children[2];
+         if(res.granted){
+             accesoCell.innerHTML = '<span class="access-badge access-yes">Con acceso</span><div style="font-size:12px;color:#718096;margin-top:2px;">Ahora</div>';
+             btn.dataset.action='revoke_access';
+             btn.classList.remove('btn-grant'); btn.classList.add('btn-revoke');
+             btn.textContent='Revocar';
+         } else {
+             accesoCell.innerHTML = '<span class="access-badge access-no">Sin acceso</span>';
+             btn.dataset.action='grant_access';
+             btn.classList.remove('btn-revoke'); btn.classList.add('btn-grant');
+             btn.textContent='Conceder';
+         }
+     }
+     if(res.hasOwnProperty('active')){
+         const activeBtn = btn.closest('td').querySelector('[data-action="toggle_active"]');
+         if(activeBtn){ activeBtn.textContent = res.active ? 'Desactivar':'Activar'; }
+         const statusCell = row.children[1].querySelector('.status-badge');
+         if(statusCell){
+             statusCell.className='status-badge status-'+(res.active?'active':'inactive');
+             statusCell.textContent = res.active?'Activo':'Inactivo';
+         }
+     }
+     if(res.temp_password){
+         alert('Contraseña temporal: '+res.temp_password); // no se loguea
+     }
+  }
+  document.addEventListener('click', e=>{
+      const btn = e.target.closest('[data-action]');
+      if(!btn) return;
+      const action = btn.dataset.action;
+      const userId = btn.dataset.user;
+      if(action==='reset_password' && !confirm('¿Resetear contraseña de este usuario?')) return;
+      post(action,userId).then(res=>{
+          if(!res.success && res.message){ alert(res.message); }
+          updateRow(btn,res);
+      });
+  });
+})();
+</script>
 </body>
 </html>

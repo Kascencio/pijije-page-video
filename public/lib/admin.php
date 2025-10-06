@@ -47,15 +47,18 @@ function authenticateAdmin($username, $password) {
     );
     
     if (!$admin) {
+        error_log('[ADMIN AUTH] Usuario no encontrado: ' . $username);
         return ['success' => false, 'error' => 'Credenciales inválidas'];
     }
     
     if (!$admin['active']) {
+        error_log('[ADMIN AUTH] Cuenta inactiva: ' . $username);
         return ['success' => false, 'error' => 'Cuenta desactivada'];
     }
     
     // Verificar contraseña
     if (!verifyPassword($password, $admin['pass_hash'])) {
+        error_log('[ADMIN AUTH] Password mismatch para usuario ' . $username);
         return ['success' => false, 'error' => 'Credenciales inválidas'];
     }
     
@@ -77,6 +80,7 @@ function authenticateAdmin($username, $password) {
     logAdminAction('admin_login', 'admin', $admin['id'], [
         'username' => $admin['username']
     ]);
+    error_log('[ADMIN AUTH] Login OK usuario ' . $username);
     
     return ['success' => true, 'admin' => $admin];
 }
@@ -143,9 +147,11 @@ function hasAdminPermission($permission) {
             'view_users',
             'edit_users',
             'view_orders',
+            'edit_orders',
             'view_videos',
             'edit_videos',
-            'view_logs'
+            'view_logs',
+            'view_settings'
         ],
         'super_admin' => [
             'all'
@@ -292,18 +298,12 @@ function formatAdminPrice($cents) {
 /**
  * Revocar acceso de usuario
  */
-function revokeAccess($userId, $courseId) {
-    $db = getDB();
-    return $db->delete('user_access', 'user_id = ? AND course_id = ?', [$userId, $courseId]);
-}
+// NOTE: revokeAccess() centralizado en access.php para evitar duplicaciones y
+// permitir logging consistente (access_revoked). Si necesitas revocar acceso
+// incluye 'access.php' y usa la implementación allí.
 
 // Funciones getRealIp() e isPost() movidas a utils.php
 
 // getFlash() y setFlash() centralizados en utils.php
 
-/**
- * Función now() para fechas
- */
-function now() {
-    return date('Y-m-d H:i:s');
-}
+// Eliminado: now() ya definida en utils.php

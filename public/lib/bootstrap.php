@@ -7,6 +7,7 @@ require_once __DIR__ . '/auth.php';
 require_once __DIR__ . '/csrf.php';
 require_once __DIR__ . '/validate.php';
 require_once __DIR__ . '/utils.php';
+require_once __DIR__ . '/paypal.php';
 
 initSecureSession();
 if (function_exists('csp_send_headers')) csp_send_headers();

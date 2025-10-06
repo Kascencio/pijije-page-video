@@ -5,6 +5,7 @@ require_once __DIR__ . '/../../lib/admin.php';
 // Verificar acceso de administrador
 requireAdmin();
 requireAdminPermission('view_videos');
+$cid = courseId();
 
 $admin = getCurrentAdmin();
 
@@ -23,25 +24,32 @@ if (isPost()) {
                 $driveFileId = trim($_POST['drive_file_id'] ?? '');
                 $order = (int)($_POST['order'] ?? 0);
                 
-                if ($title && $driveFileId && $order > 0) {
+                if ($title && $driveFileId) {
                     $db = getDB();
+                    if ($order <= 0) {
+                        // Obtener siguiente orden
+                        $next = $db->fetchOne('SELECT COALESCE(MAX(ord),0)+1 AS next_ord FROM videos WHERE course_id = ?', [$cid]);
+                        $order = (int)$next['next_ord'];
+                    } else {
+                        // Desplazar otros si hay conflicto (ord existente)
+                        $db->query('UPDATE videos SET ord = ord + 1 WHERE course_id = ? AND ord >= ?', [$cid, $order]);
+                    }
                     $db->insert('videos', [
+                        'course_id' => $cid,
                         'title' => $title,
                         'description' => $description,
                         'drive_file_id' => $driveFileId,
                         'ord' => $order,
-                        'created_at' => now()
+                        'created_at' => date('Y-m-d H:i:s')
                     ]);
-                    
-                    logAdminAction('add_video', 'video', $db->getPdo()->lastInsertId(), [
-                        'title' => $title,
-                        'drive_file_id' => $driveFileId
-                    ]);
-                    
-                    setFlash('success', 'Video agregado exitosamente');
+                    $vidId = $db->fetchOne('SELECT LAST_INSERT_ID() as id')['id'] ?? null;
+                    logAdminAction('add_video', 'video', $vidId, [ 'title' => $title, 'drive_file_id' => $driveFileId, 'ord' => $order ]);
+                    setFlash('success', 'Video agregado');
                 } else {
-                    setFlash('error', 'Todos los campos requeridos deben estar completos');
+                    setFlash('error', 'Título e ID de Drive son obligatorios (y orden >=1 si lo indicas)');
                 }
+            } else {
+                setFlash('error','No tienes permiso para agregar videos');
             }
             break;
             
@@ -51,42 +59,49 @@ if (isPost()) {
                 $description = trim($_POST['description'] ?? '');
                 $driveFileId = trim($_POST['drive_file_id'] ?? '');
                 $order = (int)($_POST['order'] ?? 0);
-                
-                if ($title && $driveFileId && $order > 0) {
+                if ($title && $driveFileId && $videoId > 0) {
                     $db = getDB();
+                    $current = $db->fetchOne('SELECT ord FROM videos WHERE id = ? AND course_id = ?', [$videoId, $cid]);
+                    if (!$current) { setFlash('error','Video no encontrado'); break; }
+                    $oldOrd = (int)$current['ord'];
+                    if ($order <= 0) { $order = $oldOrd; }
+                    if ($order !== $oldOrd) {
+                        if ($order < $oldOrd) {
+                            // Mover hacia arriba: incrementar ord de los que están entre nuevo y viejo-1
+                            $db->query('UPDATE videos SET ord = ord + 1 WHERE course_id = ? AND ord >= ? AND ord < ?', [$cid, $order, $oldOrd]);
+                        } else {
+                            // Mover hacia abajo: decrementar ord de los que están entre viejo+1 y nuevo
+                            $db->query('UPDATE videos SET ord = ord - 1 WHERE course_id = ? AND ord <= ? AND ord > ?', [$cid, $order, $oldOrd]);
+                        }
+                    }
                     $db->update('videos', [
                         'title' => $title,
                         'description' => $description,
                         'drive_file_id' => $driveFileId,
                         'ord' => $order
-                    ], 'id = ?', [$videoId]);
-                    
-                    logAdminAction('update_video', 'video', $videoId, [
-                        'title' => $title,
-                        'drive_file_id' => $driveFileId
-                    ]);
-                    
-                    setFlash('success', 'Video actualizado exitosamente');
+                    ], 'id = ? AND course_id = ?', [$videoId, $cid]);
+                    logAdminAction('update_video', 'video', $videoId, [ 'title' => $title, 'drive_file_id' => $driveFileId, 'ord' => $order ]);
+                    setFlash('success', 'Video actualizado');
                 } else {
-                    setFlash('error', 'Todos los campos requeridos deben estar completos');
+                    setFlash('error', 'Campos requeridos faltantes');
                 }
+            } else {
+                setFlash('error','No tienes permiso para editar videos');
             }
             break;
             
         case 'delete_video':
             if (hasAdminPermission('edit_videos')) {
                 $db = getDB();
-                $video = $db->fetchOne('SELECT title, drive_file_id FROM videos WHERE id = ?', [$videoId]);
-                
+                $video = $db->fetchOne('SELECT id, title, drive_file_id, ord FROM videos WHERE id = ? AND course_id = ?', [$videoId, $cid]);
                 if ($video) {
-                    $db->delete('videos', 'id = ?', [$videoId]);
-                    
-                    logAdminAction('delete_video', 'video', $videoId, [
-                        'title' => $video['title'],
-                        'drive_file_id' => $video['drive_file_id']
-                    ]);
-                    
-                    setFlash('success', 'Video eliminado exitosamente');
+                    $db->delete('videos', 'id = ? AND course_id = ?', [$videoId, $cid]);
+                    // Recompactar órdenes
+                    $db->query('UPDATE videos SET ord = ord - 1 WHERE course_id = ? AND ord > ?', [$cid, $video['ord']]);
+                    logAdminAction('delete_video', 'video', $videoId, [ 'title' => $video['title'], 'drive_file_id' => $video['drive_file_id'] ]);
+                    setFlash('success', 'Video eliminado');
+                } else {
+                    setFlash('error', 'Video no encontrado');
                 }
             }
             break;
@@ -97,7 +112,7 @@ if (isPost()) {
                 if (is_array($newOrder)) {
                     $db = getDB();
                     foreach ($newOrder as $position => $videoId) {
-                        $db->update('videos', ['ord' => $position + 1], 'id = ?', [$videoId]);
+                        $db->update('videos', ['ord' => $position + 1], 'id = ? AND course_id = ?', [$videoId, $cid]);
                     }
                     
                     logAdminAction('reorder_videos', 'video', null, [
@@ -110,12 +125,12 @@ if (isPost()) {
             break;
     }
     
-    redirect('/admin/videos/index.php');
+    redirect('admin/videos/index.php');
 }
 
 // Obtener videos
 $db = getDB();
-$videos = $db->fetchAll('SELECT * FROM videos ORDER BY ord ASC');
+$videos = $db->fetchAll('SELECT * FROM videos WHERE course_id = ? ORDER BY ord ASC', [$cid]);
 
 // Obtener flash message
 $flash = getFlash();
@@ -572,7 +587,7 @@ $flash = getFlash();
             </div>
             
             <nav class="sidebar-nav">
-                <a href="/admin/dashboard/index.php" class="nav-item">
+                <a href="<?= adminUrl('dashboard/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2H5a2 2 0 00-2-2z"/>
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5a2 2 0 012-2h4a2 2 0 012 2v2H8V5z"/>
@@ -580,28 +595,28 @@ $flash = getFlash();
                     Dashboard
                 </a>
                 
-                <a href="/admin/users/index.php" class="nav-item">
+                <a href="<?= adminUrl('users/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"/>
                     </svg>
                     Usuarios
                 </a>
                 
-                <a href="/admin/videos/index.php" class="nav-item active">
+                <a href="<?= adminUrl('videos/index.php') ?>" class="nav-item active">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                     </svg>
                     Videos
                 </a>
                 
-                <a href="/admin/payments/index.php" class="nav-item">
+                <a href="<?= adminUrl('payments/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"/>
                     </svg>
                     Pagos
                 </a>
                 
-                <a href="/admin/settings/index.php" class="nav-item">
+                <a href="<?= adminUrl('settings/index.php') ?>" class="nav-item">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
@@ -611,7 +626,7 @@ $flash = getFlash();
             </nav>
             
             <div class="logout-section">
-                <form method="POST" action="/admin/logout.php" style="margin: 0;">
+                <form method="POST" action="<?= adminUrl('logout.php') ?>" style="margin: 0;">
                     <?= csrfInput() ?>
                     <button type="submit" class="logout-btn">
                         <svg style="width: 16px; height: 16px; margin-right: 8px; vertical-align: middle;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -632,7 +647,7 @@ $flash = getFlash();
                 </div>
                 <div class="header-actions">
                     <?php if (hasAdminPermission('edit_videos')): ?>
-                        <button class="btn btn-primary" onclick="openAddModal()">
+                        <button class="btn btn-primary" type="button" data-add-video>
                             <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
                             </svg>
@@ -658,7 +673,7 @@ $flash = getFlash();
                         <h3>No hay videos</h3>
                         <p>Agrega el primer video del curso para comenzar.</p>
                         <?php if (hasAdminPermission('edit_videos')): ?>
-                            <button class="btn btn-primary" onclick="openAddModal()">
+                            <button class="btn btn-primary" type="button" data-add-video>
                                 <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
                                 </svg>
@@ -667,8 +682,13 @@ $flash = getFlash();
                         <?php endif; ?>
                     </div>
                 <?php else: ?>
-                    <?php foreach ($videos as $video): ?>
-                    <div class="video-item">
+                <?php foreach ($videos as $video): ?>
+                <div class="video-item" 
+                    data-video-id="<?= $video['id'] ?>" 
+                    data-video-title="<?= htmlspecialchars($video['title'], ENT_QUOTES | ENT_HTML5, 'UTF-8') ?>" 
+                    data-video-description="<?= htmlspecialchars($video['description'] ?? '', ENT_QUOTES | ENT_HTML5, 'UTF-8') ?>" 
+                    data-video-drive="<?= htmlspecialchars($video['drive_file_id'], ENT_QUOTES | ENT_HTML5, 'UTF-8') ?>" 
+                    data-video-ord="<?= (int)$video['ord'] ?>">
                         <div class="video-preview">
                             <iframe src="https://drive.google.com/file/d/<?= escape($video['drive_file_id']) ?>/preview" 
                                     allow="autoplay; encrypted-media" allowfullscreen>
@@ -687,10 +707,10 @@ $flash = getFlash();
                         
                         <div class="video-actions">
                             <?php if (hasAdminPermission('edit_videos')): ?>
-                                <button class="action-btn btn-edit" onclick="openEditModal(<?= htmlspecialchars(json_encode($video)) ?>)">
+                                <button class="action-btn btn-edit" type="button" data-edit-video>
                                     Editar
                                 </button>
-                                <form method="POST" style="display: inline;" onsubmit="return confirm('¿Estás seguro de eliminar este video?')">
+                                <form method="POST" style="display: inline;" class="form-delete-video">
                                     <?= csrfInput() ?>
                                     <input type="hidden" name="action" value="delete_video">
                                     <input type="hidden" name="video_id" value="<?= $video['id'] ?>">
@@ -710,7 +730,7 @@ $flash = getFlash();
         <div class="modal-content">
             <div class="modal-header">
                 <h3 class="modal-title">Agregar Video</h3>
-                <button class="modal-close" onclick="closeModal('addModal')">&times;</button>
+                <button class="modal-close" type="button" data-close-modal="addModal" aria-label="Cerrar">&times;</button>
             </div>
             
             <form method="POST">
@@ -739,7 +759,7 @@ $flash = getFlash();
                 </div>
                 
                 <div class="modal-actions">
-                    <button type="button" class="btn btn-cancel" onclick="closeModal('addModal')">Cancelar</button>
+                    <button type="button" class="btn btn-cancel" data-close-modal="addModal">Cancelar</button>
                     <button type="submit" class="btn btn-primary">Agregar Video</button>
                 </div>
             </form>
@@ -751,7 +771,7 @@ $flash = getFlash();
         <div class="modal-content">
             <div class="modal-header">
                 <h3 class="modal-title">Editar Video</h3>
-                <button class="modal-close" onclick="closeModal('editModal')">&times;</button>
+                <button class="modal-close" type="button" data-close-modal="editModal" aria-label="Cerrar">&times;</button>
             </div>
             
             <form method="POST">
@@ -780,7 +800,7 @@ $flash = getFlash();
                 </div>
                 
                 <div class="modal-actions">
-                    <button type="button" class="btn btn-cancel" onclick="closeModal('editModal')">Cancelar</button>
+                    <button type="button" class="btn btn-cancel" data-close-modal="editModal">Cancelar</button>
                     <button type="submit" class="btn btn-primary">Actualizar Video</button>
                 </div>
             </form>
@@ -788,31 +808,59 @@ $flash = getFlash();
     </div>
     
     <script nonce="<?= getNonce() ?>">
-        function openAddModal() {
-            document.getElementById('addModal').classList.add('show');
+    (function(){
+        const addBtnSelector = '[data-add-video]';
+        const editBtnSelector = '[data-edit-video]';
+        const deleteFormSelector = '.form-delete-video';
+        const addModal = document.getElementById('addModal');
+        const editModal = document.getElementById('editModal');
+
+        function openAddModal(){
+            addModal.classList.add('show');
+            // Reset and focus first input for consistency
+            const form = addModal.querySelector('form');
+            if(form){ form.reset(); const first = form.querySelector('input,textarea,select'); if(first) first.focus(); }
         }
-        
-        function openEditModal(video) {
-            document.getElementById('edit_video_id').value = video.id;
-            document.getElementById('edit_title').value = video.title;
-            document.getElementById('edit_description').value = video.description || '';
-            document.getElementById('edit_drive_file_id').value = video.drive_file_id;
-            document.getElementById('edit_order').value = video.ord;
-            document.getElementById('editModal').classList.add('show');
+        function openEditFromElement(el){
+            const item = el.closest('.video-item');
+            if(!item) return;
+            document.getElementById('edit_video_id').value = item.dataset.videoId;
+            document.getElementById('edit_title').value = item.dataset.videoTitle;
+            document.getElementById('edit_description').value = item.dataset.videoDescription || '';
+            document.getElementById('edit_drive_file_id').value = item.dataset.videoDrive;
+            document.getElementById('edit_order').value = item.dataset.videoOrd;
+            editModal.classList.add('show');
+            const first = editModal.querySelector('#edit_title'); if(first) first.focus();
         }
-        
-        function closeModal(modalId) {
-            document.getElementById(modalId).classList.remove('show');
+        function closeModal(id){
+            const m=document.getElementById(id); if(m) m.classList.remove('show');
         }
-        
-        // Cerrar modal al hacer clic fuera
+
+        // Bind add buttons
+        document.querySelectorAll(addBtnSelector).forEach(b=> b.addEventListener('click', openAddModal));
+        // Bind edit buttons
+        document.querySelectorAll(editBtnSelector).forEach(b=> b.addEventListener('click', ()=>openEditFromElement(b)));
+        // Bind delete forms confirm
+        document.querySelectorAll(deleteFormSelector).forEach(f=> f.addEventListener('submit', e=>{ if(!confirm('¿Estás seguro de eliminar este video?')) e.preventDefault(); }));
+        // Outside click to close
         document.querySelectorAll('.modal').forEach(modal => {
-            modal.addEventListener('click', function(e) {
-                if (e.target === this) {
-                    this.classList.remove('show');
-                }
-            });
+            modal.addEventListener('click', function(e){ if(e.target === this){ this.classList.remove('show'); } });
         });
+        // Close buttons (cancel / X)
+        document.querySelectorAll('[data-close-modal]').forEach(btn => {
+            btn.addEventListener('click', () => closeModal(btn.getAttribute('data-close-modal')));
+        });
+
+        // Escape key closes any open modal
+        document.addEventListener('keydown', e => {
+            if(e.key === 'Escape') {
+                [addModal, editModal].forEach(m => m.classList.remove('show'));
+            }
+        });
+
+        // (Optional) expose for future external calls without inline handlers
+        window.closeModal = closeModal;
+    })();
     </script>
 </body>
 </html>
